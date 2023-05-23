@@ -1,6 +1,6 @@
 use core::time;
 use std::cmp::min;
-use std::io::{stdin, stdout, Write, Stdout};
+use std::io::{stdin, Write, stderr, Stderr};
 use std::process::ExitCode;
 use std::thread;
 use termion::event::{Event, Key};
@@ -17,7 +17,7 @@ struct FuzzyMatcher {
     matches: Vec<String>,
     offset: usize,
     query: String,
-    stdout: RawTerminal<Stdout>,
+    outstream: RawTerminal<Stderr>,
 }
 
 enum HandleEventResult {
@@ -38,11 +38,7 @@ impl FuzzyMatcher {
             matches: Vec::new(),
             offset: 0,
             query: String::new(),
-            stdout:
-            match stdout().into_raw_mode() {
-                Ok(stdout) => stdout,
-                Err(_) => todo!()
-            },
+            outstream: stderr().into_raw_mode().unwrap()
         }
     }
 
@@ -85,7 +81,7 @@ impl FuzzyMatcher {
 
     fn clear_lines(&mut self) {
         for _ in 0..self.height + 1 {
-            write!(self.stdout, "{}\n\r", termion::clear::CurrentLine).unwrap();
+            write!(self.outstream, "{}\n\r", termion::clear::CurrentLine).unwrap();
         }
         self.move_cursor_to_top();
     }
@@ -102,7 +98,7 @@ impl FuzzyMatcher {
 
     fn print_prompt(&mut self) {
         write!(
-            self.stdout,
+            self.outstream,
             "$ {} {}[{}/{}]{}\n\r",
             self.query,
             termion::style::Faint,
@@ -121,12 +117,12 @@ impl FuzzyMatcher {
                 let (cols, _) = termion::terminal_size().unwrap();
                 let w: usize = min((cols - 10).into(), m.len());
                 if self.cursor == i {
-                    write!(self.stdout, ">{}", termion::style::Bold).unwrap();
+                    write!(self.outstream, ">{}", termion::style::Bold).unwrap();
                 } else {
-                    write!(self.stdout, " ").unwrap();
+                    write!(self.outstream, " ").unwrap();
                 }
                 write!(
-                    self.stdout,
+                    self.outstream,
                     " {} {}{}\n\r",
                     i + self.offset,
                     &m.to_string()[..w],
@@ -134,14 +130,14 @@ impl FuzzyMatcher {
                 )
                 .unwrap();
             } else {
-                write!(self.stdout, "{}\n\r", termion::clear::CurrentLine).unwrap();
+                write!(self.outstream, "{}\n\r", termion::clear::CurrentLine).unwrap();
             }
         }
     }
 
     fn move_cursor_to_top(&mut self) {
         write!(
-            self.stdout,
+            self.outstream,
             "{}",
             termion::cursor::Up((self.height + 1).try_into().unwrap()),
         )
@@ -179,7 +175,7 @@ impl FuzzyMatcher {
                 HandleEventResult::Done => {
                     // TODO: Make cursor appear in correct place
                     write!(
-                        self.stdout,
+                        self.outstream,
                         "{}{}\n\r",
                         termion::clear::CurrentLine,
                         self.matches[self.cursor + self.offset]
