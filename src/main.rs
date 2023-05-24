@@ -1,23 +1,22 @@
 use core::time;
 use std::cmp::min;
-use std::io::{stdin, Write, stderr, Stderr};
+use std::io::{stdin, Stderr, self};
 use std::process::ExitCode;
 use std::thread;
-use termion::event::{Event, Key};
-use termion::input::{Events, TermRead};
-use termion::raw::{IntoRawMode, RawTerminal};
-use termion::{self, AsyncReader};
+use std::io::Write;
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::style::{Print, Attribute, SetAttribute, Stylize};
+use crossterm::terminal::{ClearType};
+use crossterm::{terminal, execute, cursor};
 
 struct FuzzyMatcher {
     cursor: usize,
-    events: Events<AsyncReader>,
-    first_iter: bool,
     height: usize,
     items: Vec<String>,
     matches: Vec<String>,
     offset: usize,
     query: String,
-    outstream: RawTerminal<Stderr>,
+    outstream: Stderr
 }
 
 enum HandleEventResult {
@@ -29,16 +28,21 @@ enum HandleEventResult {
 
 impl FuzzyMatcher {
     fn new() -> Self {
+        terminal::enable_raw_mode().unwrap();
+        let mut stderr = io::stderr();
+        execute!(stderr,
+                 terminal::EnterAlternateScreen,
+                 cursor::Hide,
+                 cursor::MoveTo(0,0)).unwrap();
         Self {
             cursor: 0,
-            events: termion::async_stdin().events(),
-            first_iter: true,
             height: 10,
+//            height: (terminal::size().unwrap().1 - 2).try_into().unwrap(),
             items: Vec::new(),
             matches: Vec::new(),
             offset: 0,
             query: String::new(),
-            outstream: stderr().into_raw_mode().unwrap()
+            outstream: stderr
         }
     }
 
@@ -49,39 +53,52 @@ impl FuzzyMatcher {
         }
     }
 
-    fn handle_event(&mut self, event: &Option<Result<Event, std::io::Error>>) -> HandleEventResult {
-        match event {
-            Some(Ok(Event::Key(key))) => {
-                match key {
-                    Key::Char('\n') if self.matches.len() == 0 => {
+    fn handle_event(&mut self, event: &crossterm::Result<Event>) -> HandleEventResult {
+        if let Ok(Event::Key(KeyEvent{code, modifiers, ..})) = event {
+            match (code, modifiers) {
+                (KeyCode::Enter, _) =>
+                    if self.matches.len() == 0 {
                         return HandleEventResult::NoMatch
+                    } else {
+                        return HandleEventResult::Done
                     }
-                    Key::Char('\n') => {
-                        return HandleEventResult::Done;
+                (code, modifiers)
+                    if modifiers == &KeyModifiers::CONTROL
+                    || code == &KeyCode::Up || code == &KeyCode::Down
+                    => {
+                    // TODO: Add support for arrows in a nicer way
+                    match code {
+                        KeyCode::Char('c') =>
+                            return HandleEventResult::Quit,
+                        KeyCode::Char('p') | KeyCode::Up if self.cursor > 0 =>
+                            self.cursor -= 1,
+                        KeyCode::Char('p') | KeyCode::Up if self.offset > 0 =>
+                            self.offset -= 1,
+                        KeyCode::Char('n') | KeyCode::Down if self.cursor < self.height - 1 =>
+                            self.cursor += 1,
+                        KeyCode::Char('n') | KeyCode::Down
+                            if self.offset < self.matches.len() - self.height =>
+                            self.offset += 1,
+                        _ => ()
                     }
-                    Key::Ctrl('c') => return HandleEventResult::Quit,
-                    // TODO: Why doesnt Key::Up/Down register any more?
-                    Key::Ctrl('p') if self.cursor > 0 => self.cursor -= 1,
-                    Key::Ctrl('p') if self.offset > 0 => self.offset -= 1,
-                    Key::Ctrl('n') if self.cursor < self.height - 1 => self.cursor += 1,
-                    Key::Ctrl('n') if self.offset < self.matches.len() - self.height => {
-                        self.offset += 1
-                    }
-                    Key::Backspace if self.query.len() > 0 => {
-                        self.query.pop().unwrap();
-                    }
-                    Key::Char(c) => self.query.push(*c),
-                    _ => (),
                 }
+                (KeyCode::Char(c), _) =>
+                    self.query.push(*c),
+                (KeyCode::Backspace, _) if self.query.len() > 0 => {
+                    self.query.pop().unwrap();
+                }
+                _ => ()
             }
-            _ => (),
         }
         HandleEventResult::Continue
     }
 
     fn clear_lines(&mut self) {
         for _ in 0..self.height + 1 {
-            write!(self.outstream, "{}\n\r", termion::clear::CurrentLine).unwrap();
+            execute!(self.outstream,
+                     terminal::Clear(ClearType::CurrentLine),
+                     Print("\n\r")
+            ).unwrap();
         }
         self.move_cursor_to_top();
     }
@@ -97,14 +114,10 @@ impl FuzzyMatcher {
     }
 
     fn print_prompt(&mut self) {
-        write!(
+        execute!(
             self.outstream,
-            "$ {} {}[{}/{}]{}\n\r",
-            self.query,
-            termion::style::Faint,
-            self.matches.len(),
-            self.items.len(),
-            termion::style::Reset
+            Print(format!("$ {} ", self.query)),
+            Print(format!("[{}/{}]\n\r", self.matches.len(), self.items.len()).dim())
         )
         .unwrap();
     }
@@ -112,36 +125,33 @@ impl FuzzyMatcher {
     fn print_matches(&mut self) {
         for i in 0..self.height {
             if let Some(m) = self.matches.get(i + self.offset) {
-                // TODO: Handle fit on screen better..
                 // TODO: Hilight matching text
-                let (cols, _) = termion::terminal_size().unwrap();
+                let (cols, _rows) = terminal::size().unwrap();
                 let w: usize = min((cols - 10).into(), m.len());
                 if self.cursor == i {
-                    write!(self.outstream, ">{}", termion::style::Bold).unwrap();
+                    execute!(self.outstream, Print(">".red()),
+                             SetAttribute(Attribute::Bold)).unwrap();
                 } else {
                     write!(self.outstream, " ").unwrap();
                 }
-                write!(
-                    self.outstream,
-                    " {} {}{}\n\r",
-                    i + self.offset,
-                    &m.to_string()[..w],
-                    termion::style::Reset
-                )
-                .unwrap();
+                write!(self.outstream,
+                       " {} {}\n\r",
+                       i + self.offset,
+                       &m.to_string()[..w]).unwrap();
+                execute!(self.outstream,
+                         SetAttribute(Attribute::Reset)).unwrap();
             } else {
-                write!(self.outstream, "{}\n\r", termion::clear::CurrentLine).unwrap();
+                execute!(self.outstream,
+                         terminal::Clear(ClearType::CurrentLine),
+                         Print("\n\r")).unwrap();
             }
         }
     }
 
     fn move_cursor_to_top(&mut self) {
-        write!(
-            self.outstream,
-            "{}",
-            termion::cursor::Up((self.height + 1).try_into().unwrap()),
-        )
-        .unwrap();
+        execute!(self.outstream,
+                 cursor::MoveUp((self.height + 1).try_into().unwrap())
+        ).unwrap();
     }
 
     fn adjust_cursor(&mut self) {
@@ -166,33 +176,48 @@ impl FuzzyMatcher {
     }
 
     fn main(&mut self) -> ExitCode {
+
+        // TODO: Move main loop
         loop {
+            self.matches = self.find_matches();
+            self.render();
             let ten_millis = time::Duration::from_millis(1);
             thread::sleep(ten_millis);
             // TODO: Figure out how to receive windows resize event
-            let event = self.events.next();
+            let event = crossterm::event::read();
             match self.handle_event(&event) {
                 HandleEventResult::Done => {
-                    // TODO: Make cursor appear in correct place
-                    write!(
-                        self.outstream,
-                        "{}{}\n\r",
-                        termion::clear::CurrentLine,
-                        self.matches[self.cursor + self.offset]
-                    )
-                    .unwrap();
+                    self.restore_terminal();
+                    println!("{}",
+                             self.matches[self.cursor + self.offset]);
                     return ExitCode::SUCCESS;
                 }
-                HandleEventResult::NoMatch => return ExitCode::FAILURE,
-                HandleEventResult::Quit => return ExitCode::from(130),
+                HandleEventResult::NoMatch => {
+                    self.restore_terminal();
+                    return ExitCode::FAILURE
+                }
+                HandleEventResult::Quit => {
+                    self.restore_terminal();
+                    return ExitCode::from(130)
+                }
                 HandleEventResult::Continue => (),
             }
-            if event.is_some() || self.first_iter {
-                self.matches = self.find_matches();
-                self.render();
-                self.first_iter = false;
-            }
         }
+    }
+    fn restore_terminal(&mut self) {
+        terminal::disable_raw_mode().unwrap();
+        execute!(
+            self.outstream,
+            terminal::LeaveAlternateScreen,
+            cursor::Show,
+        ).unwrap();
+        //terminal.show_cursor()?;
+    }
+}
+
+impl Default for FuzzyMatcher {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
