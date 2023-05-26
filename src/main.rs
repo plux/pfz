@@ -56,6 +56,25 @@ impl MatchList {
         &self.matches[self.cursor + self.offset]
     }
 
+    fn move_up_page(&mut self) {
+        if self.cursor > 0 {
+            self.cursor = self.cursor.saturating_sub(self.height - 1);
+        } else if self.offset > 0 {
+            self.offset -= self.height - 1
+        }
+    }
+
+    fn move_down_page(&mut self) {
+        if self.cursor < self.height - 1 {
+            self.cursor += self.height - 1;
+            if self.cursor > self.height - 1 {
+                self.cursor = self.height - 1
+            }
+        } else if self.offset < self.matches.len() - self.height {
+            self.offset += self.height - 1
+        }
+    }
+
     fn move_up(&mut self) {
         if self.cursor > 0 {
             self.cursor -= 1
@@ -84,7 +103,7 @@ impl MatchList {
         }
     }
 
-    fn print(&mut self, mut outstream: &Stderr, query: &Query) {
+    fn render(&mut self, mut outstream: &Stderr, query: &Query) {
         self.adjust_cursor();
         self.adjust_offset();
         for i in 0..self.height {
@@ -186,6 +205,8 @@ impl FuzzyMatcher {
                     self.match_list.move_up(),
                 (KeyCode::Char('n'), &KeyModifiers::CONTROL) =>
                     self.match_list.move_down(),
+                (KeyCode::PageUp, _) => self.match_list.move_up_page(),
+                (KeyCode::PageDown, _) => self.match_list.move_down_page(),
                 (KeyCode::Up, _) => self.match_list.move_up(),
                 (KeyCode::Down, _) => self.match_list.move_down(),
                 (KeyCode::Char(c), _) => {
@@ -247,7 +268,7 @@ impl FuzzyMatcher {
     fn render(&mut self) {
         if self.last_render.elapsed().as_millis() > 10 {
             self.clear_lines();
-            self.match_list.print(&self.outstream, &self.query);
+            self.match_list.render(&self.outstream, &self.query);
             self.print_prompt();
             self.move_cursor_to_top();
             self.last_render = Instant::now();
