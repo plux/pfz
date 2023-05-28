@@ -4,6 +4,8 @@ use crossterm::style::{Attribute, Print, SetAttribute, Stylize};
 use crossterm::terminal::ClearType;
 use crossterm::tty::IsTty;
 use crossterm::{cursor, execute, terminal};
+use itertools::Itertools;
+use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use std::cmp::min;
 use std::io::Write;
 use std::io::{self, stdin, Stderr};
@@ -12,7 +14,6 @@ use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
-use itertools::Itertools;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -26,14 +27,13 @@ struct Args {
 }
 
 struct FuzzyMatcher {
-    items: Vec<String>,
     query: Query,
     outstream: Stderr,
     args: Args,
     match_list: MatchList,
     items_receiver: Receiver<Option<Vec<String>>>,
     last_render: Instant,
-    screen_size: (usize, usize)
+    screen_size: (usize, usize),
 }
 
 enum HandleEventResult {
@@ -41,14 +41,16 @@ enum HandleEventResult {
     NoMatch,
     Quit,
     Continue,
-    UpdateMatches
+    QueryAdd,
+    QueryRemove,
 }
 
 struct MatchList {
     pub height: usize,
     cursor: usize,
     offset: usize,
-    pub matches: Vec<String>,
+    pub matches: Vec<usize>,
+    pub items: Vec<String>,
 }
 
 impl MatchList {
@@ -58,11 +60,12 @@ impl MatchList {
             cursor: 0,
             offset: 0,
             matches: Vec::new(),
+            items: Vec::new(),
         }
     }
 
     fn get_selection(&self) -> &String {
-        &self.matches[self.cursor + self.offset]
+        &self.items[self.matches[self.cursor + self.offset]]
     }
 
     fn move_up_page(&mut self) {
@@ -119,37 +122,40 @@ impl MatchList {
         self.adjust_cursor();
         self.adjust_offset();
         for i in 0..=self.height {
-            if let Some(m) = self.matches.get(i + self.offset) {
-                let (cols, _rows) = terminal::size().unwrap();
-                let w: usize = min((cols - 10).into(), m.len());
-                if self.cursor == i {
-                    execute!(outstream, Print(">".red()), SetAttribute(Attribute::Bold)).unwrap();
-                } else {
-                    write!(outstream, " ").unwrap();
+            let item = match self.matches.get(i + self.offset) {
+                Some(m) => &self.items[*m],
+                None => {
+                    execute!(
+                        outstream,
+                        terminal::Clear(ClearType::CurrentLine),
+                        Print("\n\r")
+                    )
+                    .unwrap();
+                    continue;
                 }
-                let mut match_str = m[..w].to_string();
-                for query_part in &query.query {
-                    if let Some(begin) = match_str.find(query_part) {
-                        let end = begin + query_part.len();
-                        match_str = format!(
-                            "{}{}{}",
-                            &match_str[..begin],
-                            &match_str[begin..end].dark_cyan(),
-                            &match_str[end..]
-                        );
-                    }
-                }
-                write!(outstream, " {} {}\n\r", i + self.offset, &match_str,).unwrap();
-
-                execute!(outstream, SetAttribute(Attribute::Reset)).unwrap();
+            };
+            let (cols, _rows) = terminal::size().unwrap();
+            let w: usize = min((cols - 10).into(), item.len());
+            if self.cursor == i {
+                execute!(outstream, Print(">".red()), SetAttribute(Attribute::Bold)).unwrap();
             } else {
-                execute!(
-                    outstream,
-                    terminal::Clear(ClearType::CurrentLine),
-                    Print("\n\r")
-                )
-                .unwrap();
+                write!(outstream, " ").unwrap();
             }
+            let mut match_str = item[..w].to_string();
+            for query_part in &query.query {
+                if let Some(begin) = match_str.to_lowercase().find(&query_part.to_lowercase()) {
+                    let end = begin + query_part.len();
+                    match_str = format!(
+                        "{}{}{}",
+                        &match_str[..begin],
+                        &match_str[begin..end].dark_cyan(),
+                        &match_str[end..]
+                    );
+                }
+            }
+            write!(outstream, " {} {}\n\r", i + self.offset, &match_str,).unwrap();
+
+            execute!(outstream, SetAttribute(Attribute::Reset)).unwrap();
         }
     }
 }
@@ -172,12 +178,11 @@ impl FuzzyMatcher {
         Self {
             args,
             match_list: MatchList::new(height),
-            items: Vec::new(),
             query: Query::new(String::new()),
             outstream: stderr,
             items_receiver,
             last_render: Instant::now(),
-            screen_size: (term_width, term_height)
+            screen_size: (term_width, term_height),
         }
     }
 
@@ -187,11 +192,20 @@ impl FuzzyMatcher {
             for entry in fs::read_dir(".").unwrap() {
                 let filename = entry.unwrap().file_name();
                 let filename_str = filename.to_string_lossy();
-                items_sender.send(Some(vec![filename_str.into_owned()])).unwrap();
+                items_sender
+                    .send(Some(vec![filename_str.into_owned()]))
+                    .unwrap();
             }
         } else {
-            for chunk in &stdin().lines().map(|line| line.unwrap()).into_iter().chunks(128) {
-                items_sender.send(Some(chunk.into_iter().collect_vec())).unwrap()
+            for chunk in &stdin()
+                .lines()
+                .map(|line| line.unwrap())
+                .into_iter()
+                .chunks(128)
+            {
+                items_sender
+                    .send(Some(chunk.into_iter().collect_vec()))
+                    .unwrap()
             }
         }
         items_sender.send(None).unwrap();
@@ -200,8 +214,8 @@ impl FuzzyMatcher {
     fn handle_event(&mut self, event: &crossterm::Result<Event>) -> HandleEventResult {
         match event {
             Ok(Event::Key(KeyEvent {
-                    code, modifiers, ..
-                })) => {
+                code, modifiers, ..
+            })) => {
                 match (code, modifiers) {
                     (KeyCode::Enter, _) => {
                         if self.match_list.matches.len() == 0 {
@@ -222,13 +236,13 @@ impl FuzzyMatcher {
                         let mut query_str = self.query.query_str.to_string();
                         query_str.push(*c);
                         self.query = Query::new(query_str.to_string());
-                        return HandleEventResult::UpdateMatches;
+                        return HandleEventResult::QueryAdd;
                     }
                     (KeyCode::Backspace, _) if self.query.query_str.len() > 0 => {
                         let mut query_str = self.query.query_str.to_string();
                         query_str.pop().unwrap();
                         self.query = Query::new(query_str);
-                        return HandleEventResult::UpdateMatches;
+                        return HandleEventResult::QueryRemove;
                     }
                     _ => (),
                 }
@@ -237,7 +251,7 @@ impl FuzzyMatcher {
                 let size: (usize, usize) = ((*cols).into(), (*rows).into());
                 self.screen_size = size;
             }
-            _ => ()
+            _ => (),
         }
         HandleEventResult::Continue
     }
@@ -254,35 +268,46 @@ impl FuzzyMatcher {
         self.move_cursor_to_top();
     }
 
-    fn find_matches(&self) -> Vec<String> {
+    fn find_matches(&mut self, reading_done: bool, query_remove: bool) -> Vec<usize> {
         if self.query.query.len() == 0 {
-            // TODO: Avoid cloning, will make it faster
-            self.items.clone()
+            (0..self.match_list.items.len())
+                .into_iter()
+                .collect::<Vec<usize>>()
         } else {
-            self.items
-                .iter()
-                .filter(|&item| self.query.is_match(item))
-                .map(|item| item.to_string())
-                .collect()
+            if reading_done && !query_remove && self.match_list.matches.len() > 0 {
+                (&self.match_list.matches)
+                    .into_par_iter()
+                    .map(|i| *i)
+                    .filter(|i| self.query.is_match(&self.match_list.items[*i]))
+                    .collect()
+            } else {
+                (0..self.match_list.items.len())
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_par_iter()
+                    .filter(|i| self.query.is_match(&self.match_list.items[*i]))
+                    .collect::<Vec<_>>()
+            }
         }
     }
+
     fn render_prompt(&mut self) {
-        let info = format!(" [{}/{}]", self.match_list.matches.len(), self.items.len());
-        let prompt = &format!("> {} ",
-                             self.query.query_str,
+        let info = format!(
+            " [{}/{}]",
+            self.match_list.matches.len(),
+            self.match_list.items.len()
         );
-        let w = prompt.len() - min(self.screen_size.0, prompt.len());
-        execute!(self.outstream,
-                 terminal::Clear(ClearType::CurrentLine),
-                 Print(prompt[w..].to_string()),
-                 Print(info)
-        ).unwrap();
-//         execute!(
-//             self.outstream,
-// /            Print(format!(),
-// //            Print(" ".negative()),
-//             Print()
-//         ).unwrap();
+        let prompt = &format!("{}{}", self.query.query_str, " ".negative());
+        let w =
+            prompt.len() + info.len() + 2 - min(self.screen_size.0, prompt.len() + info.len() + 2);
+        execute!(
+            self.outstream,
+            terminal::Clear(ClearType::CurrentLine),
+            Print("> "),
+            Print(prompt[w..].to_string()),
+            Print(info.dim())
+        )
+        .unwrap();
     }
 
     fn move_cursor_to_top(&mut self) {
@@ -305,22 +330,25 @@ impl FuzzyMatcher {
         // TODO: Move main loop
         let mut update_matches = true;
         let mut update_render = true;
-        let mut update_items = true;
+        let mut reading_done = false;
+        let mut query_remove = false;
         loop {
-            if update_items {
+            if !reading_done {
                 let begin_recv = std::time::Instant::now();
                 while begin_recv.elapsed().as_millis() < 30 {
                     match self.items_receiver.recv() {
                         Ok(Some(mut chunk)) => {
-                            self.items.append(&mut chunk);
+                            self.match_list.items.append(&mut chunk);
                             update_render = true;
                             update_matches = true;
                         }
                         Ok(None) if self.args.benchmark => {
                             self.restore_terminal();
-                            return ExitCode::SUCCESS
+                            return ExitCode::SUCCESS;
                         }
-                        _ => update_items = false
+                        _ => {
+                            reading_done = true;
+                        }
                     }
                 }
             }
@@ -341,13 +369,17 @@ impl FuzzyMatcher {
                         self.restore_terminal();
                         return ExitCode::from(130);
                     }
-                    HandleEventResult::UpdateMatches => update_matches = true,
+                    HandleEventResult::QueryRemove => {
+                        query_remove = true;
+                        update_matches = true
+                    }
+                    HandleEventResult::QueryAdd => update_matches = true,
                     HandleEventResult::Continue => update_render = true,
                 }
             }
             if self.last_render.elapsed().as_millis() > 30 {
                 if update_matches {
-                        self.match_list.matches = self.find_matches()
+                    self.match_list.matches = self.find_matches(reading_done, query_remove)
                 }
                 if update_render || update_matches {
                     self.render();
@@ -380,7 +412,7 @@ fn main() -> ExitCode {
 
 struct Query {
     pub query_str: String,
-    pub query: Vec<String>
+    pub query: Vec<String>,
 }
 
 impl Query {
@@ -393,11 +425,8 @@ impl Query {
     }
 
     fn is_match(&self, item: &str) -> bool {
-        for query_part in &self.query {
-            if !item.contains(query_part) {
-                return false;
-            }
-        }
-        true
+        self.query
+            .iter()
+            .all(|q| (&item.to_lowercase()).contains(&q.to_lowercase()))
     }
 }
